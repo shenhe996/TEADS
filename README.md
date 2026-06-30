@@ -1,21 +1,17 @@
 ## TEADS — TE Anomaly Detection System
-
 # Introduction
-
 The Transposable Element Anomaly Distribution Detection System (TEADS) proposes a novel genome assembly error detection pipeline. It is grounded in biological principles—specifically, the fact that LTR retrotransposons in plants tend to be enriched near chromosome centromeres—to identify severe assembly errors that are otherwise difficult to detect through manual curation or standard sequencing QC. The method targets large-scale structural assembly errors and is particularly suited for assembly error detection in the absence of a reference genome. It also supports batch detection of assembly errors across multiple genomes.
 
 This program provides intuitive visualization of results. Users can also train their own models using custom-annotated training sets by adjusting training parameters, enabling fully self-supervised training and detection.
 
 # Overview
-
 TEADS employs a hybrid detection strategy that integrates deep learning-based reconstruction error analysis with statistical pattern recognition. The system classifies results into three tiers: normal, suspicious, and anomalous. Through built-in visualization tools, it generates TE density distribution plots and detailed statistical reports.
 
+<!-- 这是一张图片，ocr 内容为： -->
 ![](https://cdn.nlark.com/yuque/0/2026/png/54929366/1782720796303-45948eaa-2bba-449d-acf3-eba0428184f0.png)
 
 # Installation
-
 ## Install the repository and dependencies
-
 ```plain
 git clone https://github.com/shenhe996/TEADS.git
 git clone https://github.com/shenhe996/te_analysis.py
@@ -39,8 +35,8 @@ Install the following dependencies via conda or pip:
 | scikit-learn | ≥1.0.0 | 1.7.1 |
 | torch | ≥2.0.0 | 2.6.0 |
 
-## Install the annotation software
 
+## Install the annotation software
 ```plain
 # Setup
 conda create -n EDTA
@@ -55,9 +51,7 @@ EDTA.pl --help
 ```
 
 # Usage
-
 ## 1. TE Annotation and Element Density Calculation
-
 Whole-genome TE annotation is obtained using either EDTA or LTR_FINDER combined with LTR_retriever. TE density distributions are then computed using Python 3.12.11. Each chromosome or scaffold is divided into fixed-size windows—typically 100 windows per scaffold, each spanning 3 Mb. For every window, the density of distinct TE categories is calculated, including LTR retrotransposons, LINE elements, SINE elements, DNA transposons, and unclassified TEs.
 
 ```plain
@@ -82,8 +76,7 @@ LTR_retriever -genome genome_file -inharvest genome_base.finder.combine.scn -thr
 
 This produces a summary text file.
 
-## Input Data Format
-
+### Input Data Format
 ```plain
 Chr	From	To	LTR	LINE	SINE	DNA	unknown	TE
 scaffold_1	0	100000	0.123	0.045	0.012	0.067	0.003	0.250
@@ -95,7 +88,6 @@ scaffold_2	0	100000	0.089	0.056	0.018	0.045	0.001	0.209
 ```
 
 ## 2. Running TEADS
-
 TEADS is run via the Linux command line. Usage and parameters are as follows:
 
 ```bash
@@ -103,7 +95,6 @@ python TEADS [options]
 ```
 
 ### Parameters
-
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--mode` | `{train, test, both}` | — | Running mode: train a model, test with an existing model, or both |
@@ -117,8 +108,8 @@ python TEADS [options]
 | `--cnn-doubt-percentile` | `int` | `85` | Percentile threshold for CNN doubt classification |
 | `--cnn-anomaly-percentile` | `int` | `90` | Percentile threshold for CNN anomaly classification |
 
-### Examples
 
+### Examples
 ```bash
 # Train mode
 python TEADS --mode train --train-dir /path/to/data/
@@ -130,10 +121,8 @@ python TEADS --mode test --test-dir /path/to/data/
 python TEADS --mode both --train-dir /path/to/train/ --test-dir /path/to/test/
 ```
 
-## Output Files
-
+## 3.Output Files
 ### Generated Files
-
 After running the detection, you'll find:
 
 ```plain
@@ -145,7 +134,6 @@ anomaly_all_scaffolds.pdf     # Visualization of LTR distribution anomalies
 ```
 
 ### Result Columns
-
 **te_anomaly_results.csv:**
 
 | Column | Description | Values |
@@ -161,10 +149,10 @@ anomaly_all_scaffolds.pdf     # Visualization of LTR distribution anomalies
 | `Reason` | Explanation for classification | Contains 3 delta-TE outliers |
 | `Source_File` | Original input file | species1_TE_distribution.txt |
 
-### Interpreting the Results
 
+### Interpreting the Results
 In principle, both "anomaly" and "doubt" classifications warrant closer attention from the user. If a scaffold is flagged with the reason "Both pattern and CNN detected anomaly," it generally corresponds to what we consider a true LTR misdistribution pattern—indicating the presence of a large-scale assembly error on that chromosome, unless the underlying distribution genuinely conforms to such a pattern by nature. Because LTR distributions are inherently diverse, a high CNN score alone or a high pattern score alone does not rule out the possibility of a false positive. However, if manual inspection confirms that the LTR distribution pattern matches a known error type, this strongly indicates that the chromosome does contain an assembly error. Remaining ambiguous cases should be evaluated by integrating alignment against a reference genome and Hi-C signal. The presence of discrete outlier points strongly suggests a breakpoint or an anomalously distributed segment; users may also adjust the detection threshold themselves (default: 4.5).
 
 # Contact
-
 If you have any questions, please feel free to reach out: 2024302010202@webmail.hzau.edu.cn
+
