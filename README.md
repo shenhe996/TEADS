@@ -11,10 +11,9 @@ TEADS employs a hybrid detection strategy that integrates deep learning-based re
 <img width="998" height="491" alt="image" src="https://github.com/user-attachments/assets/d7b1e89d-b365-4cbf-a570-0c316c1ebd5f" />
 
 # Installation
-## Install the repository and dependencies
+## Install the repository 
 ```plain
 git clone https://github.com/shenhe996/TEADS.git
-git clone https://github.com/shenhe996/te_analysis.py
 ```
 
 It is recommended to create a dedicated conda environment:
