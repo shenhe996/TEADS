@@ -8,7 +8,7 @@ This program provides intuitive visualization of results. Users can also train t
 TEADS employs a hybrid detection strategy that integrates deep learning-based reconstruction error analysis with statistical pattern recognition. The system classifies results into three tiers: normal, suspicious, and anomalous. Through built-in visualization tools, it generates TE density distribution plots and detailed statistical reports.
 
 <!-- 这是一张图片，ocr 内容为： -->
-![](https://cdn.nlark.com/yuque/0/2026/png/54929366/1782720796303-45948eaa-2bba-449d-acf3-eba0428184f0.png)
+<img width="998" height="491" alt="image" src="https://github.com/user-attachments/assets/d7b1e89d-b365-4cbf-a570-0c316c1ebd5f" />
 
 # Installation
 ## Install the repository and dependencies
