@@ -1,0 +1,1404 @@
+# author:xuxm
+import matplotlib
+matplotlib.use('Agg') 
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+import warnings
+import argparse
+import os
+import glob
+from sklearn.model_selection import train_test_split
+from collections import defaultdict, Counter
+
+# =====================================================================
+# Configuration and Argument Parsing
+# =====================================================================
+
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description='TE Anomaly Detection System',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Usage examples:
+  python TEADS --mode train --train-dir /path/to/data/
+  python TEADS --mode test --test-dir /path/to/data/
+        '''
+    )
+    
+    # Mode selection
+    parser.add_argument('--mode', type=str, choices=['train', 'test', 'both'],
+                        help='Running mode')
+    
+    # File paths
+    parser.add_argument('--train-dir', type=str, default=None,
+                        help='Training data directory')
+    parser.add_argument('--test-dir', type=str, default=None,
+                        help='Testing data directory')
+    
+    # Training parameters
+    parser.add_argument('--min-length', type=int, default=10000000,
+                        help='Minimum scaffold length (bp), default: 10000000')
+    parser.add_argument('--batch-size', type=int, default=16,
+                        help='Batch size, default: 16')
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='Number of epochs, default: 100')
+    parser.add_argument('--lr', '--learning-rate', type=float, default=0.0001, dest='lr',
+                        help='Learning rate, default: 0.0001')
+    
+    # Detection thresholds
+    parser.add_argument('--z-threshold', type=float, default=4.5,
+                        help='Z-score threshold for outlier detection, default: 4.5')
+    parser.add_argument('--cnn-doubt-percentile', type=float, default=85,
+                        help='CNN doubt threshold percentile, default: 85')
+    parser.add_argument('--cnn-anomaly-percentile', type=float, default=90,
+                        help='CNN anomaly threshold percentile, default: 90')
+    
+    args = parser.parse_args()
+    
+    # Parameter validation
+    if args.batch_size <= 0:
+        parser.error('--batch-size must be > 0')
+    if args.epochs <= 0:
+        parser.error('--epochs must be > 0')
+    if not (0 < args.lr < 1):
+        parser.error('--lr must be between 0 and 1')
+    if args.cnn_doubt_percentile >= args.cnn_anomaly_percentile:
+        parser.error('--cnn-doubt-percentile must be < --cnn-anomaly-percentile')
+    if not (0 < args.cnn_doubt_percentile < 100):
+        parser.error('--cnn-doubt-percentile must be between 0 and 100')
+    if not (0 < args.cnn_anomaly_percentile < 100):
+        parser.error('--cnn-anomaly-percentile must be between 0 and 100')
+    
+    return args
+
+def scan_directory(directory, pattern='*.txt'):
+    """Scan directory and get all matching files"""
+    if not os.path.exists(directory):
+        raise FileNotFoundError(f"Directory not found: {directory}")
+    
+    if not os.path.isdir(directory):
+        raise NotADirectoryError(f"Path is not a directory: {directory}")
+    
+    search_path = os.path.join(directory, pattern)
+    files = sorted(glob.glob(search_path))
+    
+    if len(files) == 0:
+        raise ValueError(f"No matching files found: {search_path}")
+    
+    print(f"📂 Scanning directory: {directory}")
+    print(f"   Pattern: {pattern}")
+    print(f"   Found: {len(files)} files")
+    if len(files) <= 5:
+        for f in files:
+            print(f"     - {os.path.basename(f)}")
+    else:
+        print(f"     - {os.path.basename(files[0])}")
+        print(f"     - {os.path.basename(files[1])}")
+        print(f"     ... ({len(files)-4} files)")
+        print(f"     - {os.path.basename(files[-2])}")
+        print(f"     - {os.path.basename(files[-1])}")
+    
+    return files
+
+# Matplotlib settings
+matplotlib = plt.matplotlib
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# =====================================================================
+# Data Loading and Preprocessing
+# =====================================================================
+
+def read_multiple_files(file_paths, file_type="training"):
+    """Read and merge multiple TE distribution files"""
+    if isinstance(file_paths, str):
+        file_paths = [file_paths]
+    
+    print(f"\n=== Reading {file_type} data files ===")
+    print(f"Files: {[os.path.basename(f) for f in file_paths]}")
+    
+    all_dataframes = []
+    successful_files = []
+    failed_files = []
+    
+    for i, file_path in enumerate(file_paths, 1):
+        print(f"\n📁 Reading file {i}/{len(file_paths)}: {os.path.basename(file_path)}")
+        
+        if not os.path.exists(file_path):
+            print(f"   ❌ File not found: {file_path}")
+            failed_files.append((file_path, "File not found"))
+            continue
+        
+        file_size = os.path.getsize(file_path)
+        if file_size == 0:
+            print(f"   ❌ Empty file: {file_path}")
+            failed_files.append((file_path, "Empty file"))
+            continue
+        
+        print(f"   📊 File size: {file_size:,} bytes")
+        
+        # Try different encodings
+        read_success = False
+        for encoding in ['utf-8', 'gbk', 'latin1', 'cp1252']:
+            try:
+                print(f"   🔧 Trying encoding: {encoding}")
+                df = pd.read_csv(file_path, sep='\t', encoding=encoding)
+                
+                if len(df) == 0:
+                    print(f"   ❌ Empty data")
+                    failed_files.append((file_path, "Empty data"))
+                    break
+                
+                df['Source_File'] = os.path.basename(file_path)
+                df['Source_Index'] = i
+                
+                all_dataframes.append(df)
+                successful_files.append(file_path)
+                read_success = True
+                print(f"   ✅ Successfully added")
+                break
+                
+            except UnicodeDecodeError:
+                print(f"   ⚠️  Encoding {encoding} failed")
+                continue
+            except Exception as e:
+                print(f"   ❌ Read failed ({encoding}): {e}")
+                continue
+        
+        if not read_success:
+            print(f"   ❌ All encodings failed")
+            if file_path not in [f[0] for f in failed_files]:
+                failed_files.append((file_path, "All encodings failed"))
+    
+    # Output statistics
+    print(f"\n📊 File reading statistics:")
+    print(f"   Attempted: {len(file_paths)} files")
+    print(f"   Successful: {len(successful_files)} files")
+    print(f"   Failed: {len(failed_files)} files")
+    
+    if successful_files:
+        print(f"   ✅ Successful files:")
+        for file_path in successful_files:
+            print(f"      {os.path.basename(file_path)}")
+    
+    if failed_files:
+        print(f"   ❌ Failed files:")
+        for file_path, reason in failed_files:
+            print(f"      {os.path.basename(file_path)}: {reason}")
+    
+    if not all_dataframes:
+        raise ValueError(f"No {file_type} files successfully read! Check file format and paths.")
+    
+    # Merge all data
+    combined_df = pd.concat(all_dataframes, ignore_index=True)
+    print(f"\n✅ {file_type} data merged:")
+    print(f"   Total rows: {len(combined_df)}")
+    print(f"   Source files: {len(file_paths)}")
+    print(f"   Unique scaffolds: {combined_df['Chr'].nunique()}")
+    
+    source_stats = combined_df.groupby('Source_File')['Chr'].nunique()
+    print("   Scaffold contribution per file:")
+    for filename, count in source_stats.items():
+        print(f"     {filename}: {count} chromosomes")
+    
+    return combined_df
+
+def preprocess_data(df, min_windows=15, min_length=10000000, dataset_name=""):
+    """Preprocess data and filter scaffolds"""
+    df = df[df['Chr'] != 'whole_genome'].copy()
+    
+    # Fix scaffold naming conflicts
+    if 'Source_File' in df.columns:
+        print(f"\n=== Fixing scaffold naming conflicts ===")
+        print(f"Before: {df['Chr'].nunique()} unique scaffolds")
+        
+        def add_file_prefix(row):
+            filename = row['Source_File']
+            base_name = os.path.splitext(filename)[0]
+            
+            if '_' in base_name:
+                prefix = base_name.split('_')[0]
+            elif '.' in base_name:
+                prefix = base_name.split('.')[0]
+            else:
+                prefix = base_name[:10]
+            
+            return f"{prefix}_{row['Chr']}"
+        
+        df['Chr'] = df.apply(add_file_prefix, axis=1)
+        print(f"After: {df['Chr'].nunique()} unique scaffolds")
+    
+    df['Window_Length'] = df['To'] - df['From']
+    
+    print(f"\n=== {dataset_name} data preprocessing ===")
+    print(f"Total rows: {len(df)}")
+    print(f"Unique scaffolds: {df['Chr'].nunique()}")
+    
+    scaffolds = {}
+    filtered_scaffolds = []
+    
+    for name, group in df.groupby('Chr'):
+        group = group.sort_values('From').reset_index(drop=True)
+        scaffold_length = group['To'].max()
+        num_windows = len(group)
+        
+        if num_windows < min_windows or scaffold_length < min_length:
+            filtered_scaffolds.append({
+                'name': name,
+                'windows': num_windows,
+                'length': scaffold_length,
+                'source': group['Source_File'].iloc[0] if 'Source_File' in group.columns else 'unknown'
+            })
+            continue
+            
+        scaffolds[name] = {
+            'positions': group['From'].values,
+            'end_positions': group['To'].values,
+            'total_length': scaffold_length,
+            'values': group['TE'].values,
+            'window_lengths': group['Window_Length'].values,
+            'num_windows': num_windows,
+            'ltr': group['LTR'].values,
+            'line': group['LINE'].values,
+            'sine': group['SINE'].values,
+            'dna': group['DNA'].values,
+            'unknown': group['unknown'].values,
+            'source_file': group['Source_File'].iloc[0] if 'Source_File' in group.columns else 'unknown'
+        }
+    
+    print(f"\nFiltering statistics:")
+    print(f"  Filtered out: {len(filtered_scaffolds)} scaffolds")
+    if filtered_scaffolds:
+        filtered_by_source = defaultdict(list)
+        for item in filtered_scaffolds:
+            filtered_by_source[item['source']].append(item)
+        
+        for source, items in filtered_by_source.items():
+            print(f"    From {source}: {len(items)} scaffolds")
+            for item in items[:3]:
+                print(f"      {item['name']}: {item['windows']} windows, {item['length']:,} bp")
+            if len(items) > 3:
+                print(f"      ... and {len(items) - 3} more")
+    
+    print(f"  Retained: {len(scaffolds)} scaffolds")
+    
+    if scaffolds:
+        source_counts = Counter([data['source_file'] for data in scaffolds.values()])
+        print("  Retained scaffold distribution:")
+        for source, count in source_counts.items():
+            print(f"    {source}: {count} scaffolds")
+    
+    return scaffolds
+
+def prepare_complete_scaffolds(scaffolds, max_length=100):
+    """Process scaffolds, standardize to length 100"""
+    sequences = []
+    names = []
+    for name, data in scaffolds.items():
+        values = data['values']
+        
+        if len(values) != max_length:
+            print(f"Warning: {name} has length {len(values)}, expected {max_length}")
+        
+        sequences.append(values)
+        names.append(name)
+    
+    return sequences, names
+
+# =====================================================================
+# Model Architecture
+# =====================================================================
+
+class ScaffoldCNN(nn.Module):
+    """CNN encoder for scaffold sequences"""
+    def __init__(self, pool_size=8):
+        super().__init__()
+        self.conv1d = nn.Conv1d(1, 64, kernel_size=8, stride=1, padding=4)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=12, stride=2, padding=6)
+        self.conv3 = nn.Conv1d(128, 256, kernel_size=8, stride=2, padding=4)
+        self.global_pool = nn.AdaptiveAvgPool1d(pool_size)
+
+    def forward(self, x):
+        x = x.transpose(1, 2)
+        x = x.permute(0, 2, 1)
+        x = F.relu(self.conv1d(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = self.global_pool(x)
+        x = torch.flatten(x, start_dim=1)
+        return x
+
+class ScaffoldAutoencoder(nn.Module):
+    """Autoencoder for anomaly detection"""
+    def __init__(self, pool_size=8):
+        super().__init__()
+        self.pool_size = pool_size
+        self.encoder = ScaffoldCNN(pool_size=pool_size)
+        
+        latent_dim = 256 * pool_size
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 100)
+        )
+
+    def forward(self, x):
+        features = self.encoder(x)
+        reconstructed = self.decoder(features)
+        return reconstructed, features
+
+    def encode(self, x):
+        return self.encoder(x)
+
+# =====================================================================
+# Training
+# =====================================================================
+
+def plot_training_history(history, save_path='training_curve.png'):
+    """Visualize training loss curves"""
+    print(f"\n=== Generating training curve ===")
+    
+    train_losses = history['train_loss']
+    val_losses = history.get('val_loss', None)
+    epochs = range(1, len(train_losses) + 1)
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(epochs, train_losses, 'b-', linewidth=2, label='Training Loss', alpha=0.8)
+    
+    if val_losses and len(val_losses) > 0:
+        plt.plot(epochs, val_losses, 'r-', linewidth=2, label='Validation Loss', alpha=0.8)
+        
+        best_epoch = np.argmin(val_losses) + 1
+        best_val_loss = min(val_losses)
+        plt.scatter([best_epoch], [best_val_loss], color='red', s=100, 
+                   zorder=5, label=f'Best Val Loss: {best_val_loss:.6f} (Epoch {best_epoch})')
+        plt.axvline(x=best_epoch, color='red', linestyle='--', alpha=0.3)
+    
+    plt.xlabel('Epoch', fontsize=12, fontweight='bold')
+    plt.ylabel('Loss', fontsize=12, fontweight='bold')
+    plt.title('Training and Validation Loss Over Epochs', fontsize=14, fontweight='bold')
+    plt.legend(loc='upper right', fontsize=10)
+    plt.grid(True, alpha=0.3, linestyle='--')
+    
+    min_loss = min(train_losses)
+    if val_losses:
+        min_loss = min(min_loss, min(val_losses))
+    if min_loss > 0:
+        plt.ylim(bottom=0)
+    
+    textstr = f'Final Train Loss: {train_losses[-1]:.6f}\n'
+    if val_losses and len(val_losses) > 0:
+        textstr += f'Final Val Loss: {val_losses[-1]:.6f}\n'
+        textstr += f'Best Val Loss: {best_val_loss:.6f}'
+    
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+    plt.text(0.02, 0.98, textstr, transform=plt.gca().transAxes, 
+             fontsize=10, verticalalignment='top', bbox=props)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"✅ Training curve saved to: {save_path}")
+    plt.show()
+    plt.close()
+    
+    print(f"\nTraining statistics:")
+    print(f"  Total epochs: {len(train_losses)}")
+    print(f"  Final train loss: {train_losses[-1]:.6f}")
+    if val_losses and len(val_losses) > 0:
+        print(f"  Final val loss: {val_losses[-1]:.6f}")
+        print(f"  Best val loss: {best_val_loss:.6f} (Epoch {best_epoch})")
+
+def train_anomaly_detection_model(train_scaffolds, val_scaffolds=None, 
+                                num_epochs=100, batch_size=32, 
+                                learning_rate=0.0001, device='cuda',
+                                cnn_doubt_percentile=85,     
+                                cnn_anomaly_percentile=90):
+    """Train anomaly detection model based on reconstruction error"""
+    print("\n=== Starting anomaly detection model training ===")
+    
+    CNN_DOUBT_PERCENTILE = cnn_doubt_percentile     
+    CNN_ANOMALY_PERCENTILE = cnn_anomaly_percentile  
+    
+    # Prepare training data
+    train_sequences, train_names = prepare_complete_scaffolds(train_scaffolds)
+    train_sequences = np.array(train_sequences)
+    
+    # Data standardization
+    scaler = StandardScaler()
+    train_sequences_scaled = scaler.fit_transform(train_sequences)
+    
+    X_train = torch.FloatTensor(train_sequences_scaled).unsqueeze(1)
+    
+    train_dataset = TensorDataset(X_train)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    
+    # Prepare validation set
+    val_loader = None
+    if val_scaffolds is not None:
+        val_sequences, val_names = prepare_complete_scaffolds(val_scaffolds)
+        val_sequences_scaled = scaler.transform(val_sequences)
+        X_val = torch.FloatTensor(val_sequences_scaled).unsqueeze(1)
+        val_dataset = TensorDataset(X_val)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    # Initialize model
+    model = ScaffoldAutoencoder().to(device)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+    
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'reconstruction_errors': []
+    }
+    
+    best_val_loss = float('inf')
+    
+    # Training loop
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        train_loss = 0.0
+        
+        for batch_data in train_loader:
+            batch_x = batch_data[0].to(device)
+            
+            optimizer.zero_grad()
+            reconstructed, features = model(batch_x)
+            loss = criterion(reconstructed, batch_x.squeeze(1))
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item() * batch_x.size(0)
+        
+        avg_train_loss = train_loss / len(train_dataset)
+        history['train_loss'].append(avg_train_loss)
+        
+        # Validation phase
+        if val_loader is not None:
+            model.eval()
+            val_loss = 0.0
+            val_reconstruction_errors = []
+            
+            with torch.no_grad():
+                for batch_data in val_loader:
+                    batch_x = batch_data[0].to(device)
+                    reconstructed, features = model(batch_x)
+                    
+                    batch_errors = torch.mean((reconstructed - batch_x.squeeze(1)) ** 2, dim=1)
+                    val_reconstruction_errors.extend(batch_errors.cpu().numpy())
+                    
+                    loss = criterion(reconstructed, batch_x.squeeze(1))
+                    val_loss += loss.item() * batch_x.size(0)
+            
+            avg_val_loss = val_loss / len(val_dataset)
+            history['val_loss'].append(avg_val_loss)
+            history['reconstruction_errors'].append(val_reconstruction_errors)
+            
+            scheduler.step(avg_val_loss)
+            
+            # Save best model
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'scaler': scaler,
+                    'epoch': epoch,
+                    'best_val_loss': best_val_loss
+                }, 'best_anomaly_model.pth')
+            
+            if (epoch + 1) % 10 == 0:
+                print(f'Epoch [{epoch+1}/{num_epochs}], '
+                      f'Train Loss: {avg_train_loss:.6f}, '
+                      f'Val Loss: {avg_val_loss:.6f}')
+        else:
+            if (epoch + 1) % 10 == 0:
+                print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {avg_train_loss:.6f}')
+                
+    print("\n=== Computing validation set thresholds ===")
+    model.eval()
+    
+    # Compute error distribution on entire validation set
+    val_reconstruction_errors = []
+    with torch.no_grad():
+        for batch_data in val_loader:
+            batch_x = batch_data[0].to(device)
+            reconstructed, _ = model(batch_x)
+            errors = torch.mean((reconstructed - batch_x.squeeze(1)) ** 2, dim=1)
+            val_reconstruction_errors.extend(errors.cpu().numpy())
+    
+    val_errors = np.array(val_reconstruction_errors)
+    
+    thresholds = {
+        'doubt': np.percentile(val_errors, CNN_DOUBT_PERCENTILE),
+        'anomaly': np.percentile(val_errors, CNN_ANOMALY_PERCENTILE),
+        'mean': np.mean(val_errors),
+        'std': np.std(val_errors),
+        'doubt_percentile': CNN_DOUBT_PERCENTILE, 
+        'anomaly_percentile': CNN_ANOMALY_PERCENTILE
+    }
+    
+    print(f"Based on validation set ({len(val_errors)} samples):")
+    print(f"  Doubt threshold ({CNN_DOUBT_PERCENTILE}%):   {thresholds['doubt']:.6f}")
+    print(f"  Anomaly threshold ({CNN_ANOMALY_PERCENTILE}%): {thresholds['anomaly']:.6f}")
+
+    # Save final model
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'scaler': scaler,
+        'history': history,
+        'thresholds': thresholds
+    }, 'best_anomaly_model.pth')
+    
+    plot_training_history(history, save_path='training_curve.png')
+    print("\n✅ Model training completed")
+    
+    return model, scaler, history
+
+# =====================================================================
+# Detection
+# =====================================================================
+
+def detect_anomalies(scaffolds, model_path='best_anomaly_model.pth', device='cuda'):
+    """Detect anomalies using trained model"""
+    print("\n=== Anomaly detection ===")
+    
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file {model_path} not found. Train model first.")
+
+    # Load model and scaler
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    model = ScaffoldAutoencoder().to(device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    scaler = checkpoint['scaler']
+    
+    saved_thresholds = checkpoint.get('thresholds', None)
+    
+    if saved_thresholds:
+        print(f"✅ Using saved thresholds from training")
+    else:
+        print("⚠️ Warning: No threshold information in model file")
+    
+    # Prepare data
+    sequences, names = prepare_complete_scaffolds(scaffolds)
+    sequences_scaled = scaler.transform(sequences)
+    X = torch.FloatTensor(sequences_scaled).unsqueeze(1)
+    
+    # Compute reconstruction errors in batches
+    batch_size = 32
+    reconstruction_errors = []
+    features_list = []
+    
+    with torch.no_grad():
+        for i in range(0, len(X), batch_size):
+            batch = X[i:i+batch_size].to(device)
+            reconstructed, features = model(batch)
+            
+            errors = torch.mean((reconstructed - batch.squeeze(1)) ** 2, dim=1)
+            reconstruction_errors.extend(errors.cpu().numpy())
+            features_list.append(features.cpu().numpy())
+    
+    reconstruction_errors = np.array(reconstruction_errors)
+    all_features = np.vstack(features_list)
+    
+    results = {
+        'scaffold_names': names,
+        'anomaly_scores': reconstruction_errors,
+        'features': all_features,
+        'saved_thresholds': saved_thresholds  
+    }
+    
+    return results
+
+def detect_te_distribution_pattern(scaffold_data):
+    """Simplified TE distribution pattern detection"""
+    values = scaffold_data['values']
+    length = len(values)
+    quarter_size = length // 4
+
+    first_quarter = np.mean(values[:quarter_size])
+    second_quarter = np.mean(values[quarter_size:2*quarter_size])
+    third_quarter = np.mean(values[2*quarter_size:3*quarter_size])
+    fourth_quarter = np.mean(values[3*quarter_size:])
+    
+    ends_mean = (first_quarter + fourth_quarter) / 2
+    middle_mean = (second_quarter + third_quarter) / 2
+
+    pattern_info = {
+        'quarters_mean': [first_quarter, second_quarter, third_quarter, fourth_quarter],
+        'ends_mean': ends_mean,
+        'middle_mean': middle_mean
+    }
+
+    # Anomaly detection: ends higher than middle (valley pattern)
+    if ends_mean > middle_mean:
+        difference_ratio = (ends_mean - middle_mean) / (middle_mean + 1e-8)
+        pattern_info['difference_ratio'] = difference_ratio
+        
+        if difference_ratio > 0.1:
+            pattern_info['anomaly_confidence'] = min(difference_ratio, 1.0)
+            return 'valley_pattern_anomaly', pattern_info
+        else:
+            return 'borderline_normal', pattern_info
+    else:
+        # Normal pattern: middle higher than ends (peak pattern)
+        difference_ratio = (middle_mean - ends_mean) / (ends_mean + 1e-8)
+        pattern_info['difference_ratio'] = difference_ratio
+        
+        if difference_ratio > 0.2:
+            return 'normal_peak_pattern', pattern_info
+        else:
+            return 'flat_or_unclear', pattern_info
+
+def calculate_pattern_based_anomaly_score(pattern_type, pattern_info):
+    """Calculate anomaly score based on pattern type (0=normal, 1=anomaly)"""
+    if pattern_type == 'valley_pattern_anomaly':
+        base_score = 0.7
+        confidence = pattern_info.get('anomaly_confidence', 0)
+        return min(base_score + confidence * 0.3, 1.0)
+    elif pattern_type == 'borderline_normal':
+        return 0.4
+    elif pattern_type == 'normal_peak_pattern':
+        return 0.0
+    elif pattern_type == 'flat_or_unclear':
+        return 0.2
+    else:
+        return 0.5
+
+def run_outlier_detection_on_processed_scaffolds(scaffolds, z_threshold=4.5):
+    """Outlier detection on preprocessed scaffolds"""
+    print("\n=== Outlier detection on preprocessed scaffolds ===")
+    
+    outlier_results = {}
+    all_outliers_data = []
+    
+    for scaffold_name, scaffold_data in scaffolds.items():
+        te_values = scaffold_data['values']
+        positions = scaffold_data['positions']
+        
+        if len(te_values) < 2:
+            outlier_results[scaffold_name] = {
+                'has_outliers': False,
+                'outlier_count': 0,
+                'outlier_positions': []
+            }
+            continue
+        
+        # Compute delta TE between adjacent windows
+        delta_te_values = []
+        delta_positions = []
+        
+        for i in range(len(te_values) - 1):
+            delta_te = te_values[i] - te_values[i + 1]
+            delta_position = (positions[i] + positions[i + 1]) / 2
+            delta_te_values.append(delta_te)
+            delta_positions.append(delta_position)
+        
+        if len(delta_te_values) == 0:
+            outlier_results[scaffold_name] = {
+                'has_outliers': False,
+                'outlier_count': 0,
+                'outlier_positions': []
+            }
+            continue
+        
+        # Compute Z-score
+        delta_te_array = np.array(delta_te_values)
+        mean_delta_te = np.mean(delta_te_array)
+        std_delta_te = np.std(delta_te_array)
+        
+        if std_delta_te == 0:
+            outlier_results[scaffold_name] = {
+                'has_outliers': False,
+                'outlier_count': 0,
+                'outlier_positions': []
+            }
+            continue
+        
+        z_scores = (delta_te_array - mean_delta_te) / std_delta_te
+        
+        # Detect outliers (|Z| > threshold)
+        outlier_mask = np.abs(z_scores) > z_threshold
+        outlier_indices = np.where(outlier_mask)[0]
+        
+        if len(outlier_indices) > 0:
+            outlier_positions = [delta_positions[i] for i in outlier_indices]
+            max_z_score = np.max(np.abs(z_scores[outlier_mask]))
+            
+            outlier_results[scaffold_name] = {
+                'has_outliers': True,
+                'outlier_count': len(outlier_indices),
+                'outlier_positions': outlier_positions,
+                'max_z_score': max_z_score
+            }
+            
+            # Save detailed outlier data
+            for i, idx in enumerate(outlier_indices):
+                all_outliers_data.append({
+                    'Scaffold': scaffold_name,
+                    'LocalPosition': delta_positions[idx],
+                    'DeltaTE': delta_te_values[idx],
+                    'Z_score': z_scores[idx],
+                    'WindowIndex': idx
+                })
+        else:
+            outlier_results[scaffold_name] = {
+                'has_outliers': False,
+                'outlier_count': 0,
+                'outlier_positions': []
+            }
+    
+    # Create outliers DataFrame
+    outliers_df = pd.DataFrame(all_outliers_data)
+    
+    # Overall statistics
+    total_scaffolds = len(scaffolds)
+    has_outliers_count = sum(1 for result in outlier_results.values() if result['has_outliers'])
+    total_outliers = len(outliers_df)
+    
+    print(f"\n=== Outlier detection completed ===")
+    print(f"Scaffolds checked: {total_scaffolds}")
+    print(f"Anomalous scaffolds (with outliers): {has_outliers_count}")
+    print(f"Normal scaffolds (no outliers): {total_scaffolds - has_outliers_count}")
+    print(f"Total outliers: {total_outliers}")
+    
+    if total_outliers > 0:
+        print("\nAnomalous scaffold list:")
+        for name, result in outlier_results.items():
+            if result['has_outliers']:
+                print(f"  ❌ {name}: {result['outlier_count']} outliers (max |Z|: {result['max_z_score']:.3f})")
+    
+    return outlier_results, outliers_df
+
+def combine_anomaly_detection_fixed(scaffolds, test_df, cnn_model_path='best_anomaly_model.pth', 
+                                   device='cuda', z_threshold=4.5):
+    """Combined anomaly detection using multiple methods"""
+    
+    # Run outlier detection
+    outlier_results, outliers_df = run_outlier_detection_on_processed_scaffolds(
+        scaffolds, z_threshold=z_threshold
+    )
+    
+    # Run CNN detection
+    cnn_results = detect_anomalies(scaffolds, cnn_model_path, device=device)
+    
+    cnn_scores_raw = cnn_results['anomaly_scores']
+    pattern_results = {}
+    
+    # Initialize result lists
+    scaffold_names = cnn_results['scaffold_names']
+    pattern_scores = []
+    pattern_types = []
+    outlier_flags = []
+    pattern_statuses = []
+    cnn_statuses = []
+    final_statuses = []
+    reasons = []
+    
+    # Pattern detection for each scaffold
+    for name in scaffold_names:
+        scaffold_data = scaffolds[name]
+        
+        outlier_info = outlier_results.get(name, {
+            'has_outliers': False,
+            'outlier_count': 0,
+            'max_z_score': 0,
+            'outlier_positions': []
+        })
+        
+        pattern_type, pattern_info = detect_te_distribution_pattern(scaffold_data)
+        pattern_score = calculate_pattern_based_anomaly_score(pattern_type, pattern_info)
+        has_outliers = outlier_info.get('has_outliers', False)
+        
+        pattern_results[name] = {
+            'pattern_type': pattern_type,
+            'pattern_info': pattern_info,
+            'pattern_score': pattern_score,
+            'has_outliers': has_outliers,
+            'outlier_info': outlier_info
+        }
+        pattern_scores.append(pattern_score)
+        pattern_types.append(pattern_type)
+        outlier_flags.append(has_outliers)
+    
+    # Get thresholds
+    if 'saved_thresholds' in cnn_results and cnn_results['saved_thresholds']:
+        thresholds = cnn_results['saved_thresholds']
+        cnn_threshold_doubt = thresholds['doubt']
+        cnn_threshold_anomaly = thresholds['anomaly']
+        
+        doubt_pct = thresholds.get('doubt_percentile', 85)
+        anomaly_pct = thresholds.get('anomaly_percentile', 90)
+        
+        print(f"✅ Using saved thresholds from training:")
+        print(f"  Doubt ({doubt_pct}%): {cnn_threshold_doubt:.6f}")
+        print(f"  Anomaly ({anomaly_pct}%): {cnn_threshold_anomaly:.6f}")
+    else:
+        print("⚠️ Warning: No saved thresholds, computing from test set")
+        cnn_threshold_doubt = np.percentile(cnn_scores_raw, 85)
+        cnn_threshold_anomaly = np.percentile(cnn_scores_raw, 90)
+        print(f"  Doubt: {cnn_threshold_doubt:.6f}")
+        print(f"  Anomaly: {cnn_threshold_anomaly:.6f}")
+    
+    # Classification logic
+    for i in range(len(scaffold_names)):
+        scaffold_name = scaffold_names[i]
+        cnn_score = cnn_scores_raw[i]
+        pattern_score = pattern_scores[i]
+        has_outliers = outlier_flags[i]
+        outlier_count = pattern_results[scaffold_name]['outlier_info'].get('outlier_count', 0)
+        
+        pattern_status = 'normal'
+        cnn_status = 'normal'
+        final_status = 'normal'
+        reason = 'Unknown'
+        
+        # Special rule: outliers => anomaly
+        if has_outliers:
+            pattern_status = 'anomaly'
+            
+            if cnn_score <= cnn_threshold_doubt:
+                cnn_status = 'normal'
+            elif cnn_score < cnn_threshold_anomaly:
+                cnn_status = 'doubt'
+            else:
+                cnn_status = 'anomaly'
+            
+            final_status = 'anomaly'
+            reason = f'Contains {outlier_count} delta-TE outliers'
+        else:
+            # Pattern classification
+            if pattern_score <= 0.3:
+                pattern_status = 'normal'
+            elif pattern_score < 0.7:
+                pattern_status = 'doubt'
+            else:
+                pattern_status = 'anomaly'
+            
+            # CNN classification
+            if cnn_score <= cnn_threshold_doubt:
+                cnn_status = 'normal'
+            elif cnn_score < cnn_threshold_anomaly:
+                cnn_status = 'doubt'
+            else:
+                cnn_status = 'anomaly'
+            
+            # Final combined judgment
+            if pattern_status == 'anomaly' or cnn_status == 'anomaly':
+                final_status = 'anomaly'
+                if pattern_status == 'anomaly' and cnn_status == 'anomaly':
+                    reason = 'Both pattern and CNN detected anomaly'
+                elif pattern_status == 'anomaly':
+                    reason = 'Pattern detected anomaly'
+                else:
+                    reason = 'CNN detected anomaly'
+            elif pattern_status == 'doubt' or cnn_status == 'doubt':
+                final_status = 'doubt'
+                if pattern_status == 'doubt' and cnn_status == 'doubt':
+                    reason = 'Both pattern and CNN doubtful'
+                elif pattern_status == 'doubt':
+                    reason = 'Pattern doubtful'
+                else:
+                    reason = 'CNN doubtful'
+            else:
+                final_status = 'normal'
+                reason = 'Both pattern and CNN normal'
+        
+        pattern_statuses.append(pattern_status)
+        cnn_statuses.append(cnn_status)
+        final_statuses.append(final_status)
+        reasons.append(reason)
+    
+    # Statistics
+    num_anomaly = final_statuses.count('anomaly')
+    num_doubt = final_statuses.count('doubt')
+    num_normal = final_statuses.count('normal')
+    num_outliers = sum(outlier_flags)
+    total = len(scaffold_names)
+    
+    # Organize results
+    results = {
+        'scaffold_names': scaffold_names,
+        'cnn_scores': cnn_scores_raw,
+        'pattern_scores': pattern_scores,
+        'pattern_types': pattern_types,
+        'pattern_results': pattern_results,
+        'pattern_statuses': pattern_statuses,
+        'cnn_statuses': cnn_statuses,
+        'final_statuses': final_statuses,
+        'reasons': reasons,
+        'outlier_flags': outlier_flags,
+        'outlier_results': outlier_results,
+        'outliers_df': outliers_df,
+        'num_anomaly': num_anomaly,
+        'num_doubt': num_doubt,
+        'num_normal': num_normal,
+        'num_outliers': num_outliers,
+        'anomaly_rate': num_anomaly / total,
+        'doubt_rate': num_doubt / total,
+        'thresholds': {
+            'cnn_doubt': cnn_threshold_doubt,
+            'cnn_anomaly': cnn_threshold_anomaly,
+            'pattern_doubt': 0.3,
+            'pattern_anomaly': 0.7,
+            'outlier_zscore': z_threshold
+        }
+    }
+    
+    # Output statistics
+    print(f"\n=== Detection statistics ===")
+    print(f"Total scaffolds: {total}")
+    print(f"\nResults by method:")
+    print(f"  CNN anomalies: {cnn_statuses.count('anomaly')} ({cnn_statuses.count('anomaly')/total:.2%})")
+    print(f"  Pattern anomalies: {pattern_statuses.count('anomaly')} ({pattern_statuses.count('anomaly')/total:.2%})")
+    print(f"  Outlier anomalies: {num_outliers} ({num_outliers/total:.2%})")
+    
+    print(f"\nFinal combined results:")
+    print(f"  Anomalous: {num_anomaly} ({results['anomaly_rate']:.2%})")
+    print(f"  Doubtful: {num_doubt} ({results['doubt_rate']:.2%})")
+    print(f"  Normal: {num_normal} ({num_normal/total:.2%})")
+    
+    if num_outliers > 0:
+        print(f"\n=== Outlier details ===")
+        for name in scaffold_names:
+            outlier_info = outlier_results.get(name, {})
+            if outlier_info.get('has_outliers', False):
+                print(f"  {name}:")
+                print(f"    Outlier count: {outlier_info.get('outlier_count', 0)}")
+                print(f"    Max Z-score: {outlier_info.get('max_z_score', 0):.3f}")
+    
+    return results
+
+# =====================================================================
+# Visualization and Results
+# =====================================================================
+
+def visualize_classification_results(scaffolds, results, max_plots=5000):
+    """Visualize classification results by category"""
+    print(f"\n=== Visualizing classification results ===")
+    
+    anomaly_indices = [i for i, status in enumerate(results['final_statuses']) if status == 'anomaly']
+    doubt_indices = [i for i, status in enumerate(results['final_statuses']) if status == 'doubt']
+    
+    if len(anomaly_indices) == 0 and len(doubt_indices) == 0:
+        print("✅ All scaffolds are normal")
+        return
+    
+    # Prioritize anomalies, then doubts
+    display_indices = anomaly_indices[:max_plots]
+    if len(display_indices) < max_plots:
+        remaining_slots = max_plots - len(display_indices)
+        display_indices.extend(doubt_indices[:remaining_slots])
+    
+    display_count = min(max_plots, len(display_indices))
+    if display_count == 0:
+        return
+
+    print(f"Displaying {display_count} non-normal scaffolds")
+    
+    cols = min(3, display_count)
+    rows = (display_count + cols - 1) // cols
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(6*cols, 4*rows))
+    if display_count == 1:
+        axes = [axes]
+    elif rows == 1:
+        axes = axes if isinstance(axes, np.ndarray) else [axes]
+    else:
+        axes = axes.flatten()
+    
+    for i in range(display_count):
+        idx = display_indices[i]
+        scaffold_name = results['scaffold_names'][idx]
+        
+        if scaffold_name not in scaffolds:
+            continue
+            
+        data = scaffolds[scaffold_name]
+        positions = data['positions'] / 1000000  # Convert to Mb
+        
+        ax = axes[i]
+        
+        # Plot TE composition
+        ax.plot(positions, data['ltr'], 'b-', label='LTR', linewidth=2, alpha=0.7)
+        ax.plot(positions, data['line'], 'r-', label='LINE', linewidth=2, alpha=0.7)
+        ax.plot(positions, data['sine'], 'g-', label='SINE', linewidth=2, alpha=0.7)
+        ax.plot(positions, data['dna'], 'm-', label='DNA', linewidth=2, alpha=0.7)
+        ax.plot(positions, data['unknown'], 'c-', label='Unknown', linewidth=2, alpha=0.7)
+        ax.plot(positions, data['values'], 'k-', label='Total_TE', linewidth=3)
+        
+        final_status = results['final_statuses'][idx]
+        reason = results['reasons'][idx]
+        cnn_score = results['cnn_scores'][idx]
+        pattern_score = results['pattern_scores'][idx]
+        
+        status_color = {'anomaly': 'red', 'doubt': 'orange', 'normal': 'green'}.get(final_status, 'black')
+        
+        title = f"{scaffold_name} ({final_status.upper()})\n{reason}\nCNN:{cnn_score:.3f}, Pattern:{pattern_score:.3f}"
+        ax.set_title(title, fontsize=9, color=status_color, weight='bold' if final_status == 'anomaly' else 'normal')
+        ax.set_xlabel('Genomic position (Mb)', fontsize=9)
+        ax.set_ylabel('TE density', fontsize=9)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+    
+    # Hide extra subplots
+    for i in range(display_count, len(axes)):
+        axes[i].set_visible(False)
+    
+    plt.tight_layout()
+    output_dir = './anomaly_plots'
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f'anomaly_all_scaffolds.pdf') 
+    plt.savefig(output_path, dpi=500, bbox_inches='tight')
+    plt.close()
+    print(f"✓ 图片已保存: {output_path}")
+    return display_indices
+
+def save_results(results, scaffolds, output_dir="results"):
+    """Save detection results"""
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    results_df = pd.DataFrame({
+        'Scaffold': results['scaffold_names'],
+        'CNN_Score': results['cnn_scores'],
+        'Pattern_Score': results['pattern_scores'],
+        'Pattern_Type': results['pattern_types'],
+        'Pattern_Status': results['pattern_statuses'],
+        'CNN_Status': results['cnn_statuses'],
+        'Has_Outliers': results.get('outlier_flags', [False] * len(results['scaffold_names'])),
+        'Final_Status': results['final_statuses'],
+        'Reason': results['reasons'],
+    })
+    
+    # Add source file info
+    source_files = []
+    for name in results['scaffold_names']:
+        if name in scaffolds:
+            source_files.append(scaffolds[name].get('source_file', 'unknown'))
+        else:
+            source_files.append('unknown')
+    results_df['Source_File'] = source_files
+    
+    # Save complete results
+    results_path = os.path.join(output_dir, "te_anomaly_results.csv")
+    results_df.to_csv(results_path, index=False)
+    print(f"✅ Complete results saved to: {results_path}")
+    
+    # Save anomalous scaffolds
+    anomalies = results_df[results_df['Final_Status'] == 'anomaly']
+    if len(anomalies) > 0:
+        anomaly_path = os.path.join(output_dir, "anomalous_scaffolds.csv")
+        anomalies.to_csv(anomaly_path, index=False)
+        print(f"✅ Anomalous scaffolds saved to: {anomaly_path} ({len(anomalies)} scaffolds)")
+    
+    return results_path, results_df
+
+# =====================================================================
+# Main Execution
+# =====================================================================
+
+def main_anomaly_detection_fixed(mode='both', args=None):
+    """Main function supporting three modes: train, test, both"""
+    
+    # Get file paths
+    if args and args.train_dir:
+        try:
+            TRAIN_FILES = scan_directory(args.train_dir)
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            return None, None, None
+    else:
+        if mode in ['train', 'both']:
+            print("\n📂 Training data configuration:")
+            train_dir = input("Enter training data directory path: ").strip()
+            if not train_dir:
+                print("❌ Error: Must specify training data path")
+                return None, None, None
+            try:
+                TRAIN_FILES = scan_directory(train_dir)
+            except Exception as e:
+                print(f"❌ Error: {e}")
+                return None, None, None
+        else:
+            TRAIN_FILES = []
+    
+    if args and args.test_dir:
+        try:
+            TEST_FILES = scan_directory(args.test_dir)
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            return None, None, None
+    else:
+        if mode in ['test', 'both']:
+            print("\n📂 Test data configuration:")
+            test_dir = input("Enter test data directory path: ").strip()
+            if not test_dir:
+                print("❌ Error: Must specify test data path")
+                return None, None, None
+            try:
+                TEST_FILES = scan_directory(test_dir)
+            except Exception as e:
+                print(f"❌ Error: {e}")
+                return None, None, None
+        else:
+            TEST_FILES = []
+    
+    # Get parameters
+    if args:
+        MIN_LENGTH = args.min_length
+        BATCH_SIZE = args.batch_size
+        NUM_EPOCHS = args.epochs
+        LEARNING_RATE = args.lr
+        Z_THRESHOLD = args.z_threshold
+        CNN_DOUBT_PERCENTILE = args.cnn_doubt_percentile
+        CNN_ANOMALY_PERCENTILE = args.cnn_anomaly_percentile
+    else:
+        MIN_LENGTH = 10000000
+        BATCH_SIZE = 16
+        NUM_EPOCHS = 100
+        LEARNING_RATE = 0.0001
+        Z_THRESHOLD = 4.5
+        CNN_DOUBT_PERCENTILE = 85
+        CNN_ANOMALY_PERCENTILE = 90
+    
+    MIN_WINDOWS = 15
+    MODEL_PATH = 'best_anomaly_model.pth'
+    
+    print("🚀 Starting TE anomaly detection pipeline")
+    print("=" * 60)
+    
+    try:
+        # ============================================================
+        # Mode 1: Training
+        # ============================================================
+        if mode == 'train':
+            print("📚 Mode: Training")
+            print("-" * 60)
+            
+            train_df = read_multiple_files(TRAIN_FILES, "training")
+            train_scaffolds = preprocess_data(train_df, MIN_WINDOWS, MIN_LENGTH, "training")
+            
+            scaffold_names = list(train_scaffolds.keys())
+            train_names, val_names = train_test_split(scaffold_names, test_size=0.4, random_state=42)
+            
+            train_scaffolds_split = {name: train_scaffolds[name] for name in train_names}
+            val_scaffolds_split = {name: train_scaffolds[name] for name in val_names}
+            
+            print(f"Training scaffolds: {len(train_scaffolds_split)}")
+            print(f"Validation scaffolds: {len(val_scaffolds_split)}")
+            
+            model, scaler, history = train_anomaly_detection_model(
+                train_scaffolds_split, 
+                val_scaffolds_split,
+                num_epochs=NUM_EPOCHS, 
+                batch_size=BATCH_SIZE,
+                learning_rate=LEARNING_RATE,
+                device=device,
+                cnn_doubt_percentile=CNN_DOUBT_PERCENTILE,
+                cnn_anomaly_percentile=CNN_ANOMALY_PERCENTILE
+            )
+            
+            print("\n" + "=" * 60)
+            print("✅ Training completed!")
+            print(f"📁 Best model saved to: {MODEL_PATH}")
+            print("=" * 60)
+            
+            return None, model, None
+        
+        # ============================================================
+        # Mode 2: Testing
+        # ============================================================
+        elif mode == 'test':
+            print("🔍 Mode: Testing")
+            print("-" * 60)
+            
+            if not os.path.exists(MODEL_PATH):
+                print("❌ Error: Trained model not found!")
+                print(f"📁 Ensure {MODEL_PATH} exists")
+                print("💡 Tip: Run training mode first")
+                return None, None, None
+            
+            print(f"✅ Found model file: {MODEL_PATH}")
+            
+            test_df = read_multiple_files(TEST_FILES, "testing")
+            test_scaffolds = preprocess_data(test_df, MIN_WINDOWS, MIN_LENGTH, "testing")
+            
+            results = combine_anomaly_detection_fixed(
+                test_scaffolds, 
+                test_df,
+                cnn_model_path=MODEL_PATH,
+                device=device,
+                z_threshold=Z_THRESHOLD
+            )
+            
+            print(f"\nTotal test scaffolds: {len(results['scaffold_names'])}")
+            print(f"Detected anomalies: {results['num_anomaly']}")
+            print(f"Anomaly rate: {results['anomaly_rate']:.2%}")
+            
+            visualize_classification_results(test_scaffolds, results, max_plots=5000)
+            output_path, results_df = save_results(results, test_scaffolds)
+            
+            anomalies = results_df[results_df['Final_Status'] == 'anomaly']
+            if len(anomalies) > 0:
+                print(f"\n📋 Anomalous scaffold details:")
+                print("=" * 80)
+                for i, (_, row) in enumerate(anomalies.iterrows(), 1):
+                    print(f"{i:2d}. {row['Scaffold']} (source: {row.get('Source_File', 'unknown')})")
+                    print(f"    CNN score: {row['CNN_Score']:.4f}")
+                    print(f"    Pattern score: {row['Pattern_Score']:.4f}")
+                    print(f"    Pattern type: {row['Pattern_Type']}")
+                    print(f"    Reason: {row['Reason']}")
+                    print(f"    Has outliers: {'Yes' if row['Has_Outliers'] else 'No'}")
+                    print()
+            
+            print("🎉 Testing completed!")
+            print(f"📁 Results file: {output_path}")
+            
+            return results, None, test_scaffolds
+        
+        # ============================================================
+        # Mode 3: Complete pipeline (train + test)
+        # ============================================================
+        elif mode == 'both':
+            print("🔄 Mode: Complete pipeline (train + test)")
+            print("-" * 60)
+            
+            train_df = read_multiple_files(TRAIN_FILES, "training")
+            test_df = read_multiple_files(TEST_FILES, "testing")
+            
+            train_scaffolds = preprocess_data(train_df, MIN_WINDOWS, MIN_LENGTH, "training")
+            test_scaffolds = preprocess_data(test_df, MIN_WINDOWS, MIN_LENGTH, "testing")
+            
+            scaffold_names = list(train_scaffolds.keys())
+            train_names, val_names = train_test_split(scaffold_names, test_size=0.4, random_state=42)
+            
+            train_scaffolds_split = {name: train_scaffolds[name] for name in train_names}
+            val_scaffolds_split = {name: train_scaffolds[name] for name in val_names}
+            
+            print(f"Training scaffolds: {len(train_scaffolds_split)}")
+            print(f"Validation scaffolds: {len(val_scaffolds_split)}")
+            
+            model, scaler, history = train_anomaly_detection_model(
+                train_scaffolds_split, 
+                val_scaffolds_split,
+                num_epochs=NUM_EPOCHS, 
+                batch_size=BATCH_SIZE,
+                learning_rate=LEARNING_RATE,
+                device=device,
+                cnn_doubt_percentile=CNN_DOUBT_PERCENTILE,
+                cnn_anomaly_percentile=CNN_ANOMALY_PERCENTILE
+            )
+            
+            print(f"\n💾 Best model saved to: {MODEL_PATH}")
+            
+            results = combine_anomaly_detection_fixed(
+                test_scaffolds, 
+                test_df,
+                cnn_model_path=MODEL_PATH,
+                device=device,
+                z_threshold=Z_THRESHOLD
+            )
+            
+            print(f"\nTotal test scaffolds: {len(results['scaffold_names'])}")
+            print(f"Detected anomalies: {results['num_anomaly']}")
+            print(f"Anomaly rate: {results['anomaly_rate']:.2%}")
+            
+            visualize_classification_results(test_scaffolds, results, max_plots=5000)
+            output_path, results_df = save_results(results, test_scaffolds)
+            
+            anomalies = results_df[results_df['Final_Status'] == 'anomaly']
+            if len(anomalies) > 0:
+                print(f"\n📋 Anomalous scaffold details:")
+                print("=" * 80)
+                for i, (_, row) in enumerate(anomalies.iterrows(), 1):
+                    print(f"{i:2d}. {row['Scaffold']} (source: {row.get('Source_File', 'unknown')})")
+                    print(f"    CNN score: {row['CNN_Score']:.4f}")
+                    print(f"    Pattern score: {row['Pattern_Score']:.4f}")
+                    print(f"    Pattern type: {row['Pattern_Type']}")
+                    print(f"    Reason: {row['Reason']}")
+                    print(f"    Has outliers: {'Yes' if row['Has_Outliers'] else 'No'}")
+                    print()
+            
+            print("🎉 TE anomaly detection pipeline completed!")
+            print(f"📁 Results file: {output_path}")
+            
+            return results, model, test_scaffolds
+        
+        else:
+            print(f"❌ Error: Unknown mode '{mode}'")
+            return None, None, None
+            
+    except Exception as e:
+        print(f"❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None, None, None
+
+def main():
+    """Interactive entry function"""
+    args = parse_arguments()
+    
+    print("\n" + "="*60)
+    print("🧬 TE Transposon Anomaly Detection System")
+    print("="*60)
+    
+    if args.mode:
+        mode = args.mode
+        print(f"\n▶️  Running mode: {mode}")
+    else:
+        print("\n📋 Select running mode:")
+        print("  [1] Training - Train new model and save")
+        print("  [2] Testing - Detect using trained model")
+        print("  [3] Complete - Train + Test")
+        print("-"*60)
+        
+        while True:
+            choice = input("\n👉 Enter choice (1/2/3): ").strip()
+            
+            if choice == '1':
+                mode = 'train'
+                break
+            elif choice == '2':
+                mode = 'test'
+                break
+            elif choice == '3':
+                mode = 'both'
+                break
+            else:
+                print("❌ Invalid input, enter 1, 2, or 3")
+    
+    print(f"\n📋 Current configuration:")
+    print(f"   Mode: {mode}")
+    if args.train_dir:
+        print(f"   Training data: {args.train_dir}")
+    if args.test_dir:
+        print(f"   Test data: {args.test_dir}")
+    print(f"   Batch size: {args.batch_size}")
+    print(f"   Epochs: {args.epochs}")
+    print(f"   Learning rate: {args.lr}")
+    print(f"   Min length: {args.min_length} bp")
+    print(f"   Z-threshold: {args.z_threshold}")
+    print("-"*60)
+    
+    print(f"\n▶️  Starting execution\n")
+    results_df, model, test_scaffolds = main_anomaly_detection_fixed(mode=mode, args=args)
+    
+    return results_df, model, test_scaffolds
+    
+if __name__ == "__main__":
+    results_df, model, test_scaffolds = main()
