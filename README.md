@@ -138,7 +138,7 @@ anomaly_all_scaffolds.pdf     # Visualization of LTR distribution anomalies
 
 | Column | Description | Values |
 | --- | --- | --- |
-| `Scaffold` | Scaffold name | scaffold_1 |
+| `chromosome` | chromosome name | chromosome_1 |
 | `CNN_Score` | Reconstruction error from autoencoder | 0.0 - 1.0+ |
 | `Pattern_Score` | Distribution pattern anomaly score | 0.0 - 1.0 |
 | `Pattern_Type` | Detected pattern type | valley_pattern_anomaly, normal_peak_pattern, etc. |
