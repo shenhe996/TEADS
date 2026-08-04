@@ -1,0 +1,106 @@
+#!/bin/bash
+#SBATCH --job-name=ltr_array
+#SBATCH --array=111-119%9
+#SBATCH --nodes=1                    
+#SBATCH --ntasks=1                   
+#SBATCH --cpus-per-task=20  
+#SBATCH --mem=40G
+#SBATCH --output=%a/ltr_%A_%a.out
+#SBATCH --error=%a/ltr_%A_%a.err
+
+
+source /#/miniconda3/etc/profile.d/conda.sh
+conda activate EDTA
+
+
+CORES=20
+
+
+cd "${SLURM_ARRAY_TASK_ID}" || { echo "Directory ${SLURM_ARRAY_TASK_ID} not found"; exit 1; }
+
+
+genome_file=$(find . -maxdepth 1 -type f \( -iname "*.fa" -o -iname "*.fasta" -o -iname "*.fna" -o -iname "*.fsa_nt" \) | head -n 1)
+
+if [[ ! -f "$genome_file" ]]; then
+  echo "No genome fasta file found in directory ${SLURM_ARRAY_TASK_ID}" >&2
+  exit 1
+fi
+
+
+genome_base=$(basename "$genome_file")
+
+echo "Processing genome: $genome_base"
+echo "Starting LTR_FINDER..."
+
+
+echo "Checking sequence ID lengths..."
+
+
+max_id_length=$(grep "^>" "$genome_file" | awk '{print length($1)}' | sort -nr | head -1)
+echo "Maximum sequence ID length: $max_id_length"
+
+
+if [[ $max_id_length -gt 13 ]]; then
+    echo "Sequence IDs are too long for LTR_FINDER (max: $max_id_length > 13)"
+    echo "Modifying sequence IDs in place..."
+    
+  
+    mapping_file="id_mapping.txt"
+    echo "Creating ID mapping file: $mapping_file"
+    grep "^>" "$genome_file" | awk -v prefix="${SLURM_ARRAY_TASK_ID}__" \
+        '{print prefix "seq" NR "\t" substr($0,2)}' > "$mapping_file"
+    
+    
+    original_count=$(grep -c "^>" "$genome_file")
+    mapping_count=$(wc -l < "$mapping_file")
+    
+    if [[ $original_count -eq $mapping_count ]]; then
+        echo "ID mapping file created successfully ($mapping_count sequences)"
+    else
+        echo "Error: Sequence count mismatch in mapping file!" >&2
+        echo "Original: $original_count, Mapping: $mapping_count" >&2
+        exit 1
+    fi
+    
+    temp_file=$(mktemp "${genome_file}.tmp.XXXXXX")
+    echo "Creating temporary file: $temp_file"
+    
+    awk -v prefix="${SLURM_ARRAY_TASK_ID}__" \
+        '/^>/{print ">" prefix "seq" ++i; next}{print}' \
+        "$genome_file" > "$temp_file"
+    
+
+    temp_count=$(grep -c "^>" "$temp_file")
+    if [[ $original_count -eq $temp_count ]]; then
+        
+        mv "$temp_file" "$genome_file"
+        echo "Successfully modified sequence IDs in $genome_base"
+        echo "Original sequences: $original_count -> Modified sequences: $temp_count"
+        
+       
+        echo "New sequence IDs (first 5):"
+        grep "^>" "$genome_file" | head -5
+        
+      
+        new_max_length=$(grep "^>" "$genome_file" | awk '{print length($1)}' | sort -nr | head -1)
+        echo "New maximum sequence ID length: $new_max_length"
+        
+    else
+        echo "Error: Sequence count mismatch after modification!" >&2
+        echo "Original: $original_count, Modified: $temp_count" >&2
+        rm -f "$temp_file"
+        exit 1
+    fi
+    
+else
+    echo "Sequence IDs are within acceptable length (≤13), no modification needed"
+fi
+
+#  LTR_FINDER_parallel
+LTR_FINDER_parallel -seq "$genome_file" -threads $CORES -harvest_out
+
+echo "LTR_FINDER completed. "
+
+#  LTR_retriever
+LTR_retriever -genome "$genome_file" -inharvest "${genome_base}.finder.combine.scn" -threads $CORES
+
